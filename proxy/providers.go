@@ -13,6 +13,7 @@ import (
 	"strings"
 	"sync"
 
+	"github.com/sozercan/vekil/logger"
 	"gopkg.in/yaml.v3"
 )
 
@@ -31,7 +32,24 @@ var openAICodexProviderEndpoints = []string{"/responses"}
 // When empty, the proxy keeps its legacy zero-config Copilot behavior.
 type ProvidersConfig struct {
 	Providers      []ProviderConfig     `json:"providers" yaml:"providers"`
+	ModelRoutes    []ModelRouteConfig   `json:"model_routes,omitempty" yaml:"model_routes,omitempty"`
 	ToolOptimizers ToolOptimizersConfig `json:"tool_optimizers,omitempty" yaml:"tool_optimizers,omitempty"`
+}
+
+// ModelRouteConfig exposes one synthetic public model backed by provider/model candidates.
+type ModelRouteConfig struct {
+	PublicID   string                      `json:"public_id" yaml:"public_id"`
+	Endpoints  []string                    `json:"endpoints,omitempty" yaml:"endpoints,omitempty"`
+	Selector   string                      `json:"selector,omitempty" yaml:"selector,omitempty"`
+	Candidates []ModelRouteCandidateConfig `json:"candidates" yaml:"candidates"`
+}
+
+// ModelRouteCandidateConfig references a model owned by one configured provider.
+type ModelRouteCandidateConfig struct {
+	Provider string                       `json:"provider" yaml:"provider"`
+	Model    string                       `json:"model" yaml:"model"`
+	Weight   *int                         `json:"weight,omitempty" yaml:"weight,omitempty"`
+	Health   ProviderEndpointHealthConfig `json:"health,omitempty" yaml:"health,omitempty"`
 }
 
 // ProviderConfig configures one upstream provider instance.
@@ -39,14 +57,33 @@ type ProviderConfig struct {
 	ID            string                      `json:"id" yaml:"id"`
 	Type          string                      `json:"type" yaml:"type"`
 	Default       bool                        `json:"default,omitempty" yaml:"default,omitempty"`
+	Selector      string                      `json:"selector,omitempty" yaml:"selector,omitempty"`
 	IncludeModels []string                    `json:"include_models,omitempty" yaml:"include_models,omitempty"`
 	ExcludeModels []string                    `json:"exclude_models,omitempty" yaml:"exclude_models,omitempty"`
 	BaseURL       string                      `json:"base_url,omitempty" yaml:"base_url,omitempty"`
 	APIKey        string                      `json:"api_key,omitempty" yaml:"api_key,omitempty"`
 	APIKeyEnv     string                      `json:"api_key_env,omitempty" yaml:"api_key_env,omitempty"`
 	APIVersion    string                      `json:"api_version,omitempty" yaml:"api_version,omitempty"`
+	Endpoints     []ProviderEndpointConfig    `json:"endpoints,omitempty" yaml:"endpoints,omitempty"`
 	Headers       CopilotHeaderProfilesConfig `json:"headers,omitempty" yaml:"headers,omitempty"`
 	Models        []ProviderModelConfig       `json:"models,omitempty" yaml:"models,omitempty"`
+}
+
+// ProviderEndpointConfig configures one upstream endpoint inside a provider-local pool.
+type ProviderEndpointConfig struct {
+	ID         string                       `json:"id" yaml:"id"`
+	BaseURL    string                       `json:"base_url" yaml:"base_url"`
+	APIKey     string                       `json:"api_key,omitempty" yaml:"api_key,omitempty"`
+	APIKeyEnv  string                       `json:"api_key_env,omitempty" yaml:"api_key_env,omitempty"`
+	APIVersion string                       `json:"api_version,omitempty" yaml:"api_version,omitempty"`
+	Weight     *int                         `json:"weight,omitempty" yaml:"weight,omitempty"`
+	Health     ProviderEndpointHealthConfig `json:"health,omitempty" yaml:"health,omitempty"`
+}
+
+// ProviderEndpointHealthConfig controls endpoint quarantine behavior.
+type ProviderEndpointHealthConfig struct {
+	ErrorBudget string `json:"error_budget,omitempty" yaml:"error_budget,omitempty"`
+	Cooldown    string `json:"cooldown,omitempty" yaml:"cooldown,omitempty"`
 }
 
 // ProviderModelConfig maps a public model ID exposed by this proxy to the
@@ -71,6 +108,9 @@ type providerRuntime struct {
 	baseURL        string
 	apiKey         string
 	apiVersion     string
+	selector       providerEndpointSelectorKind
+	endpoints      []*providerEndpointRuntime
+	selectorState  providerEndpointSelectorState
 	includeModels  map[string]struct{}
 	excludeModels  map[string]struct{}
 	staticModels   map[string]providerModel
@@ -95,6 +135,11 @@ type providerSetup struct {
 	defaultProviderID  string
 	modelsMu           sync.RWMutex
 	models             map[string]providerModel
+	providerModels     map[string]map[string]providerModel
+	modelRoutes        map[string]*modelRouteRuntime
+	modelRouteOrder    []string
+	routeCandidateRefs map[string]struct{}
+	ambiguousModelIDs  map[string]struct{}
 	hasConfiguredState bool
 }
 
@@ -210,10 +255,17 @@ func defaultProviderSetup(h *ProxyHandler) *providerSetup {
 	return &providerSetup{
 		providers: map[string]*providerRuntime{
 			"copilot": {
-				id:            "copilot",
-				kind:          providerTypeCopilot,
-				isDefault:     true,
-				baseURL:       strings.TrimRight(h.copilotURL, "/"),
+				id:        "copilot",
+				kind:      providerTypeCopilot,
+				isDefault: true,
+				baseURL:   strings.TrimRight(h.copilotURL, "/"),
+				selector:  providerEndpointSelectorRoundRobin,
+				endpoints: []*providerEndpointRuntime{{
+					id:      "default",
+					baseURL: strings.TrimRight(h.copilotURL, "/"),
+					weight:  1,
+					health:  mustDefaultProviderEndpointHealth(),
+				}},
 				includeModels: map[string]struct{}{},
 				excludeModels: map[string]struct{}{},
 				staticModels:  map[string]providerModel{},
@@ -222,6 +274,8 @@ func defaultProviderSetup(h *ProxyHandler) *providerSetup {
 		providerOrder:     []string{"copilot"},
 		defaultProviderID: "copilot",
 		models:            map[string]providerModel{},
+		providerModels:    map[string]map[string]providerModel{},
+		modelRoutes:       map[string]*modelRouteRuntime{},
 	}
 }
 
@@ -256,6 +310,39 @@ func (ps *providerSetup) lookupModel(model string) (providerModel, bool) {
 	return pm, ok
 }
 
+func (ps *providerSetup) lookupProviderModel(providerID, model string) (providerModel, bool) {
+	if ps == nil {
+		return providerModel{}, false
+	}
+	ps.modelsMu.RLock()
+	defer ps.modelsMu.RUnlock()
+	models := ps.providerModels[strings.TrimSpace(providerID)]
+	if models == nil {
+		return providerModel{}, false
+	}
+	pm, ok := models[strings.TrimSpace(model)]
+	return pm, ok
+}
+
+func (ps *providerSetup) lookupModelRoute(model string) (*modelRouteRuntime, bool) {
+	if ps == nil {
+		return nil, false
+	}
+	route := ps.modelRoutes[strings.TrimSpace(model)]
+	return route, route != nil
+}
+
+func (ps *providerSetup) setProviderModels(providerID string, models []providerModel) {
+	if ps.providerModels == nil {
+		ps.providerModels = make(map[string]map[string]providerModel)
+	}
+	byID := make(map[string]providerModel, len(models))
+	for _, model := range models {
+		byID[model.publicID] = model
+	}
+	ps.providerModels[providerID] = byID
+}
+
 func (ps *providerSetup) replaceProviderModels(providerID string, models []providerModel) error {
 	if ps == nil {
 		return nil
@@ -267,7 +354,7 @@ func (ps *providerSetup) replaceProviderModels(providerID string, models []provi
 	ps.modelsMu.Lock()
 	defer ps.modelsMu.Unlock()
 
-	next := make(map[string]providerModel, len(ps.models)+len(models))
+	next := make(map[string]providerModel, len(ps.models)+len(models)+len(ps.modelRoutes))
 	for publicID, model := range ps.models {
 		if model.providerID == providerID {
 			continue
@@ -275,13 +362,22 @@ func (ps *providerSetup) replaceProviderModels(providerID string, models []provi
 		next[publicID] = model
 	}
 
+	ps.setProviderModels(providerID, models)
+	oldModels := ps.models
+	ps.models = next
 	for _, model := range models {
-		if existing, exists := next[model.publicID]; exists && existing.providerID != model.providerID {
-			return providerModelCollisionError(model.publicID, existing.providerID, model.providerID)
+		if err := ps.addCatalogProviderModel(model); err != nil {
+			ps.models = oldModels
+			return err
 		}
-		next[model.publicID] = model
 	}
-
+	next = ps.models
+	for _, routeID := range ps.modelRouteOrder {
+		route := ps.modelRoutes[routeID]
+		if route != nil {
+			next[route.publicID] = route.syntheticModel()
+		}
+	}
 	ps.models = next
 	return nil
 }
@@ -326,6 +422,10 @@ func (h *ProxyHandler) buildConfiguredProviderSetup(ctx context.Context, cfg Pro
 		providerOrder:      providerOrder,
 		defaultProviderID:  defaultProviderID,
 		models:             make(map[string]providerModel),
+		providerModels:     make(map[string]map[string]providerModel),
+		modelRoutes:        make(map[string]*modelRouteRuntime),
+		routeCandidateRefs: collectModelRouteCandidateRefs(cfg.ModelRoutes),
+		ambiguousModelIDs:  make(map[string]struct{}),
 		hasConfiguredState: true,
 	}
 
@@ -333,15 +433,16 @@ func (h *ProxyHandler) buildConfiguredProviderSetup(ctx context.Context, cfg Pro
 
 	if !needsDynamicModelValidation {
 		for _, provider := range providers {
-			for _, model := range filterProviderModels(provider, orderedStaticProviderModels(provider)) {
-				if existing, exists := setup.models[model.publicID]; exists {
-					if existing.providerID == model.providerID {
-						continue
-					}
-					return nil, providerModelCollisionError(model.publicID, existing.providerID, model.providerID)
+			models := filterProviderModels(provider, orderedStaticProviderModels(provider))
+			setup.setProviderModels(provider.id, models)
+			for _, model := range models {
+				if err := setup.addCatalogProviderModel(model); err != nil {
+					return nil, err
 				}
-				setup.models[model.publicID] = model
 			}
+		}
+		if err := setup.buildModelRoutes(cfg.ModelRoutes); err != nil {
+			return nil, err
 		}
 		return setup, nil
 	}
@@ -356,11 +457,12 @@ func (h *ProxyHandler) buildConfiguredProviderSetup(ctx context.Context, cfg Pro
 	for _, providerID := range providerOrder {
 		provider := providers[providerID]
 		if !providerUsesDynamicModels(provider) {
-			for _, model := range filterProviderModels(provider, orderedStaticProviderModels(provider)) {
-				if existing, exists := setup.models[model.publicID]; exists {
-					return nil, providerModelCollisionError(model.publicID, existing.providerID, model.providerID)
+			models := filterProviderModels(provider, orderedStaticProviderModels(provider))
+			setup.setProviderModels(provider.id, models)
+			for _, model := range models {
+				if err := setup.addCatalogProviderModel(model); err != nil {
+					return nil, err
 				}
-				setup.models[model.publicID] = model
 			}
 			continue
 		}
@@ -369,18 +471,77 @@ func (h *ProxyHandler) buildConfiguredProviderSetup(ctx context.Context, cfg Pro
 		if err != nil {
 			return nil, fmt.Errorf("load models for provider %q: %w", provider.id, err)
 		}
-		for _, model := range filterProviderModels(provider, result.models) {
-			if existing, exists := setup.models[model.publicID]; exists {
-				if existing.providerID == model.providerID {
-					continue
-				}
-				return nil, providerModelCollisionError(model.publicID, existing.providerID, model.providerID)
+		models := filterProviderModels(provider, result.models)
+		setup.setProviderModels(provider.id, models)
+		for _, model := range models {
+			if err := setup.addCatalogProviderModel(model); err != nil {
+				return nil, err
 			}
-			setup.models[model.publicID] = model
 		}
 	}
 
+	if err := setup.buildModelRoutes(cfg.ModelRoutes); err != nil {
+		return nil, err
+	}
+
 	return setup, nil
+}
+
+func (ps *providerSetup) addCatalogProviderModel(model providerModel) error {
+	if _, ambiguous := ps.ambiguousModelIDs[model.publicID]; ambiguous {
+		if ps.isModelRouteCandidate(model.providerID, model.publicID) {
+			return nil
+		}
+		return providerModelCollisionError(model.publicID, "explicit model route candidates", model.providerID)
+	}
+	if existing, exists := ps.models[model.publicID]; exists {
+		if existing.providerID == model.providerID {
+			return nil
+		}
+		if ps.isModelRouteCandidate(existing.providerID, existing.publicID) && ps.isModelRouteCandidate(model.providerID, model.publicID) {
+			delete(ps.models, model.publicID)
+			if ps.ambiguousModelIDs == nil {
+				ps.ambiguousModelIDs = make(map[string]struct{})
+			}
+			ps.ambiguousModelIDs[model.publicID] = struct{}{}
+			return nil
+		}
+		return providerModelCollisionError(model.publicID, existing.providerID, model.providerID)
+	}
+	ps.models[model.publicID] = model
+	return nil
+}
+
+func collectModelRouteCandidateRefs(routes []ModelRouteConfig) map[string]struct{} {
+	refs := make(map[string]struct{})
+	for _, route := range routes {
+		for _, candidate := range route.Candidates {
+			providerID := strings.TrimSpace(candidate.Provider)
+			modelID := strings.TrimSpace(candidate.Model)
+			if providerID != "" && modelID != "" {
+				refs[providerID+"/"+modelID] = struct{}{}
+			}
+		}
+	}
+	return refs
+}
+
+func (ps *providerSetup) isModelRouteCandidate(providerID, modelID string) bool {
+	if ps == nil || ps.routeCandidateRefs == nil {
+		return false
+	}
+	_, ok := ps.routeCandidateRefs[strings.TrimSpace(providerID)+"/"+strings.TrimSpace(modelID)]
+	return ok
+}
+
+func (ps *providerSetup) providerOwnedModelIDExists(publicID string) bool {
+	publicID = strings.TrimSpace(publicID)
+	for _, models := range ps.providerModels {
+		if _, ok := models[publicID]; ok {
+			return true
+		}
+	}
+	return false
 }
 
 func (h *ProxyHandler) buildProviders(cfg ProvidersConfig) (map[string]*providerRuntime, []string, string, error) {
@@ -481,29 +642,32 @@ func buildProviderRuntime(cfg ProviderConfig, defaultCopilotURL string) (*provid
 
 	switch kind {
 	case providerTypeCopilot:
+		if len(cfg.Endpoints) > 0 {
+			return nil, fmt.Errorf("provider %q endpoints are supported only for azure-openai providers in v1; Copilot multi-account rotation is deferred", id)
+		}
 		runtime.baseURL = strings.TrimRight(defaultCopilotURL, "/")
+		runtime.selector = providerEndpointSelectorRoundRobin
+		runtime.endpoints = []*providerEndpointRuntime{{
+			id:      "default",
+			baseURL: runtime.baseURL,
+			weight:  1,
+			health:  mustDefaultProviderEndpointHealth(),
+		}}
 		runtime.headerProfiles = cfg.Headers
 	case providerTypeAzureOpenAI:
-		baseURL := strings.TrimRight(strings.TrimSpace(cfg.BaseURL), "/")
-		if baseURL == "" {
-			return nil, fmt.Errorf("provider %q must set base_url", id)
+		endpoints, err := buildAzureProviderEndpoints(id, cfg)
+		if err != nil {
+			return nil, err
 		}
-		switch classifyAzureBaseURL(baseURL) {
-		case azureBaseURLKindOpenAIV1, azureBaseURLKindLegacyOpenAI:
-		case azureBaseURLKindModels:
-			return nil, fmt.Errorf("provider %q has unsupported Azure base_url %q: Azure AI Foundry /models inference endpoints are not supported; use the OpenAI-compatible endpoint ending in /openai/v1 instead", id, baseURL)
-		default:
-			return nil, fmt.Errorf("provider %q has unsupported Azure base_url %q: expected an absolute URL whose path ends in /openai/v1 or /openai, with no query string or fragment", id, baseURL)
+		runtime.endpoints = endpoints
+		runtime.baseURL = endpoints[0].baseURL
+		runtime.apiVersion = endpoints[0].apiVersion
+		runtime.apiKey = endpoints[0].apiKey
+		selector, err := parseProviderEndpointSelector(cfg.Selector, len(endpoints))
+		if err != nil {
+			return nil, fmt.Errorf("provider %q: %w", id, err)
 		}
-		runtime.baseURL = baseURL
-		runtime.apiVersion = strings.TrimSpace(cfg.APIVersion)
-		runtime.apiKey = strings.TrimSpace(cfg.APIKey)
-		if runtime.apiKey == "" && strings.TrimSpace(cfg.APIKeyEnv) != "" {
-			runtime.apiKey = strings.TrimSpace(os.Getenv(strings.TrimSpace(cfg.APIKeyEnv)))
-		}
-		if runtime.apiKey == "" {
-			return nil, fmt.Errorf("provider %q must set api_key or api_key_env", id)
-		}
+		runtime.selector = selector
 		if len(cfg.Models) == 0 {
 			return nil, fmt.Errorf("provider %q must configure at least one model", id)
 		}
@@ -523,6 +687,9 @@ func buildProviderRuntime(cfg ProviderConfig, defaultCopilotURL string) (*provid
 			runtime.staticOrder = append(runtime.staticOrder, model.publicID)
 		}
 	case providerTypeOpenAICodex:
+		if len(cfg.Endpoints) > 0 {
+			return nil, fmt.Errorf("provider %q endpoints are supported only for azure-openai providers in v1", id)
+		}
 		baseURL := strings.TrimRight(strings.TrimSpace(cfg.BaseURL), "/")
 		if baseURL == "" {
 			baseURL = defaultOpenAICodexBaseURL
@@ -535,10 +702,126 @@ func buildProviderRuntime(cfg ProviderConfig, defaultCopilotURL string) (*provid
 			return nil, fmt.Errorf("provider %q: %w", id, err)
 		}
 		runtime.baseURL = baseURL
+		runtime.selector = providerEndpointSelectorRoundRobin
+		runtime.endpoints = []*providerEndpointRuntime{{
+			id:      "default",
+			baseURL: baseURL,
+			weight:  1,
+			health:  mustDefaultProviderEndpointHealth(),
+		}}
 		runtime.codexAuth = codexAuth
 	}
 
 	return runtime, nil
+}
+
+func buildAzureProviderEndpoints(providerID string, cfg ProviderConfig) ([]*providerEndpointRuntime, error) {
+	if len(cfg.Endpoints) == 0 {
+		baseURL := strings.TrimRight(strings.TrimSpace(cfg.BaseURL), "/")
+		if baseURL == "" {
+			return nil, fmt.Errorf("provider %q must set base_url", providerID)
+		}
+		if err := validateAzureProviderBaseURL(providerID, baseURL); err != nil {
+			return nil, err
+		}
+		apiKey, err := resolveProviderAPIKey(providerID, "api_key", cfg.APIKey, cfg.APIKeyEnv)
+		if err != nil {
+			return nil, err
+		}
+		health, err := newProviderEndpointHealthRuntime(ProviderEndpointHealthConfig{})
+		if err != nil {
+			return nil, fmt.Errorf("provider %q endpoint default health: %w", providerID, err)
+		}
+		return []*providerEndpointRuntime{{
+			id:         "default",
+			baseURL:    baseURL,
+			apiKey:     apiKey,
+			apiVersion: strings.TrimSpace(cfg.APIVersion),
+			weight:     1,
+			health:     health,
+		}}, nil
+	}
+
+	endpoints := make([]*providerEndpointRuntime, 0, len(cfg.Endpoints))
+	seen := make(map[string]struct{}, len(cfg.Endpoints))
+	for i, endpointCfg := range cfg.Endpoints {
+		fieldPath := fmt.Sprintf("providers[%q].endpoints[%d]", providerID, i)
+		endpointID := strings.TrimSpace(endpointCfg.ID)
+		if endpointID == "" {
+			return nil, fmt.Errorf("%s.id is required", fieldPath)
+		}
+		if _, exists := seen[endpointID]; exists {
+			return nil, fmt.Errorf("provider %q has duplicate endpoint id %q", providerID, endpointID)
+		}
+		seen[endpointID] = struct{}{}
+
+		baseURL := strings.TrimRight(strings.TrimSpace(endpointCfg.BaseURL), "/")
+		if baseURL == "" {
+			return nil, fmt.Errorf("%s.base_url is required", fieldPath)
+		}
+		if err := validateAzureProviderBaseURL(providerID, baseURL); err != nil {
+			return nil, fmt.Errorf("%s.base_url: %w", fieldPath, err)
+		}
+
+		apiKeyRaw := endpointCfg.APIKey
+		apiKeyEnv := endpointCfg.APIKeyEnv
+		if strings.TrimSpace(apiKeyRaw) == "" && strings.TrimSpace(apiKeyEnv) == "" {
+			apiKeyRaw = cfg.APIKey
+			apiKeyEnv = cfg.APIKeyEnv
+		}
+		apiKey, err := resolveProviderAPIKey(providerID, fieldPath, apiKeyRaw, apiKeyEnv)
+		if err != nil {
+			return nil, err
+		}
+
+		weight := 1
+		if endpointCfg.Weight != nil {
+			weight = *endpointCfg.Weight
+		}
+		if weight <= 0 {
+			return nil, fmt.Errorf("%s.weight must be greater than 0", fieldPath)
+		}
+
+		health, err := newProviderEndpointHealthRuntime(endpointCfg.Health)
+		if err != nil {
+			return nil, fmt.Errorf("%s.health: %w", fieldPath, err)
+		}
+		apiVersion := strings.TrimSpace(endpointCfg.APIVersion)
+		if apiVersion == "" {
+			apiVersion = strings.TrimSpace(cfg.APIVersion)
+		}
+		endpoints = append(endpoints, &providerEndpointRuntime{
+			id:         endpointID,
+			baseURL:    baseURL,
+			apiKey:     apiKey,
+			apiVersion: apiVersion,
+			weight:     weight,
+			health:     health,
+		})
+	}
+	return endpoints, nil
+}
+
+func validateAzureProviderBaseURL(providerID, baseURL string) error {
+	switch classifyAzureBaseURL(baseURL) {
+	case azureBaseURLKindOpenAIV1, azureBaseURLKindLegacyOpenAI:
+		return nil
+	case azureBaseURLKindModels:
+		return fmt.Errorf("provider %q has unsupported Azure base_url %q: Azure AI Foundry /models inference endpoints are not supported; use the OpenAI-compatible endpoint ending in /openai/v1 instead", providerID, baseURL)
+	default:
+		return fmt.Errorf("provider %q has unsupported Azure base_url %q: expected an absolute URL whose path ends in /openai/v1 or /openai, with no query string or fragment", providerID, baseURL)
+	}
+}
+
+func resolveProviderAPIKey(providerID, fieldPath, apiKeyRaw, apiKeyEnv string) (string, error) {
+	apiKey := strings.TrimSpace(apiKeyRaw)
+	if apiKey == "" && strings.TrimSpace(apiKeyEnv) != "" {
+		apiKey = strings.TrimSpace(os.Getenv(strings.TrimSpace(apiKeyEnv)))
+	}
+	if apiKey == "" {
+		return "", fmt.Errorf("provider %q %s must set api_key or api_key_env", providerID, fieldPath)
+	}
+	return apiKey, nil
 }
 
 func filterProviderModels(provider *providerRuntime, models []providerModel) []providerModel {
@@ -805,16 +1088,28 @@ func rewriteRequestModelForProvider(body []byte, upstreamModel string) ([]byte, 
 }
 
 func (h *ProxyHandler) providerRequestURL(provider *providerRuntime, path string, extraQuery string) (string, error) {
+	return h.providerEndpointRequestURL(provider, nil, path, extraQuery)
+}
+
+func (h *ProxyHandler) providerEndpointRequestURL(provider *providerRuntime, endpoint *providerEndpointRuntime, path string, extraQuery string) (string, error) {
 	if provider == nil {
 		return "", fmt.Errorf("provider is required")
 	}
+	if endpoint == nil && len(provider.endpoints) > 0 {
+		endpoint = provider.endpoints[0]
+	}
 
 	baseURL := strings.TrimRight(provider.baseURL, "/")
+	apiVersion := provider.apiVersion
+	if endpoint != nil {
+		baseURL = strings.TrimRight(endpoint.baseURL, "/")
+		apiVersion = strings.TrimSpace(endpoint.apiVersion)
+	}
 	fullURL := baseURL + path
-	if provider.kind != providerTypeAzureOpenAI || provider.apiVersion == "" || classifyAzureBaseURL(baseURL) == azureBaseURLKindOpenAIV1 {
+	if provider.kind != providerTypeAzureOpenAI || apiVersion == "" || classifyAzureBaseURL(baseURL) == azureBaseURLKindOpenAIV1 {
 		return appendRawQuery(fullURL, extraQuery), nil
 	}
-	return appendRawQuery(fullURL, appendQuery("api-version="+url.QueryEscape(provider.apiVersion), extraQuery)), nil
+	return appendRawQuery(fullURL, appendQuery("api-version="+url.QueryEscape(apiVersion), extraQuery)), nil
 }
 
 func classifyAzureBaseURL(baseURL string) azureBaseURLKind {
@@ -885,6 +1180,10 @@ func appendRawQuery(rawURL, rawQuery string) string {
 }
 
 func (h *ProxyHandler) applyProviderHeaders(req *http.Request, provider *providerRuntime, endpoint string) error {
+	return h.applyProviderEndpointHeaders(req, provider, nil, endpoint)
+}
+
+func (h *ProxyHandler) applyProviderEndpointHeaders(req *http.Request, provider *providerRuntime, upstreamEndpoint *providerEndpointRuntime, endpoint string) error {
 	if provider == nil {
 		return &providerRequestError{statusCode: http.StatusInternalServerError, err: fmt.Errorf("provider is required")}
 	}
@@ -898,7 +1197,11 @@ func (h *ProxyHandler) applyProviderHeaders(req *http.Request, provider *provide
 		h.setCopilotHeadersForProvider(req, token, provider, endpoint)
 	case providerTypeAzureOpenAI:
 		clearCopilotHeaders(req.Header)
-		req.Header.Set("api-key", provider.apiKey)
+		apiKey := provider.apiKey
+		if upstreamEndpoint != nil {
+			apiKey = upstreamEndpoint.apiKey
+		}
+		req.Header.Set("api-key", apiKey)
 		req.Header.Set("Content-Type", "application/json")
 	case providerTypeOpenAICodex:
 		clearCopilotHeaders(req.Header)
@@ -924,7 +1227,11 @@ func (h *ProxyHandler) applyProviderHeaders(req *http.Request, provider *provide
 }
 
 func (h *ProxyHandler) newProviderJSONRequest(ctx context.Context, provider *providerRuntime, method, path string, body []byte, extraHeaders http.Header, extraQuery string) (*http.Request, error) {
-	fullURL, err := h.providerRequestURL(provider, path, extraQuery)
+	return h.newProviderEndpointJSONRequest(ctx, provider, nil, method, path, body, extraHeaders, extraQuery)
+}
+
+func (h *ProxyHandler) newProviderEndpointJSONRequest(ctx context.Context, provider *providerRuntime, upstreamEndpoint *providerEndpointRuntime, method, path string, body []byte, extraHeaders http.Header, extraQuery string) (*http.Request, error) {
+	fullURL, err := h.providerEndpointRequestURL(provider, upstreamEndpoint, path, extraQuery)
 	if err != nil {
 		return nil, err
 	}
@@ -941,8 +1248,11 @@ func (h *ProxyHandler) newProviderJSONRequest(ctx context.Context, provider *pro
 	if len(extraHeaders) > 0 {
 		mergeHeaderValues(req.Header, extraHeaders)
 	}
-	if err := h.applyProviderHeaders(req, provider, path); err != nil {
+	if err := h.applyProviderEndpointHeaders(req, provider, upstreamEndpoint, path); err != nil {
 		return nil, err
+	}
+	if h != nil && h.log != nil && upstreamEndpoint != nil {
+		h.log.Debug("selected upstream endpoint", logger.F("provider", provider.id), logger.F("endpoint_id", upstreamEndpoint.id), logger.F("upstream_endpoint", path))
 	}
 	return req, nil
 }

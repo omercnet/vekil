@@ -44,7 +44,7 @@ These overrides only affect Copilot-backed upstream requests. For provider-level
 
 Use `--providers-config` or `PROVIDERS_CONFIG` when you need explicit ownership of public model IDs across providers. Provider config files can be JSON (`.json`) or YAML (`.yaml`/`.yml`).
 
-- See [Provider Routing](provider-routing.md) for auth notes, provider examples, routing rules, endpoint allowlists, and model metadata.
+- See [Provider Routing](provider-routing.md) for auth notes, provider examples, Azure upstream endpoint pools, routing rules, endpoint allowlists, and model metadata.
 - See [Tool Optimizers](tool-optimizers.md) for the optional `tool_optimizers` block that can live alongside `providers` in the same config file.
 
 ## Responses WebSocket Bridge

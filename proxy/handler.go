@@ -840,6 +840,8 @@ func (h *ProxyHandler) buildMergedModelsEntry(ctx context.Context, rawQuery, ifN
 	setup := h.providerSetup()
 	rawEntries := make([]json.RawMessage, 0)
 	owners := make(map[string]string)
+	ownerIndex := make(map[string]int)
+	ambiguousRouteCandidateModels := make(map[string]struct{})
 	refreshedDynamicModels := make(map[string][]providerModel)
 	mergedETag := ""
 	sawDynamicProvider := false
@@ -861,13 +863,25 @@ func (h *ProxyHandler) buildMergedModelsEntry(ctx context.Context, rawQuery, ifN
 		if result.notModified {
 			models = filterProviderModels(provider, setup.modelsForProvider(provider.id))
 			for _, model := range models {
+				if _, ambiguous := ambiguousRouteCandidateModels[model.publicID]; ambiguous && setup.isModelRouteCandidate(model.providerID, model.publicID) {
+					continue
+				}
 				if existingProvider, exists := owners[model.publicID]; exists {
 					if existingProvider == model.providerID {
+						continue
+					}
+					if setup.isModelRouteCandidate(existingProvider, model.publicID) && setup.isModelRouteCandidate(model.providerID, model.publicID) {
+						if idx, ok := ownerIndex[model.publicID]; ok {
+							rawEntries[idx] = nil
+						}
+						delete(owners, model.publicID)
+						ambiguousRouteCandidateModels[model.publicID] = struct{}{}
 						continue
 					}
 					return cachedModelsResponse{}, false, providerModelCollisionError(model.publicID, existingProvider, model.providerID)
 				}
 				owners[model.publicID] = model.providerID
+				ownerIndex[model.publicID] = len(rawEntries)
 				rawEntries = append(rawEntries, model.raw)
 			}
 		}
@@ -887,16 +901,44 @@ func (h *ProxyHandler) buildMergedModelsEntry(ctx context.Context, rawQuery, ifN
 		}
 
 		for _, model := range models {
+			if _, ambiguous := ambiguousRouteCandidateModels[model.publicID]; ambiguous && setup.isModelRouteCandidate(model.providerID, model.publicID) {
+				continue
+			}
 			if existingProvider, exists := owners[model.publicID]; exists {
 				if existingProvider == model.providerID {
+					continue
+				}
+				if setup.isModelRouteCandidate(existingProvider, model.publicID) && setup.isModelRouteCandidate(model.providerID, model.publicID) {
+					if idx, ok := ownerIndex[model.publicID]; ok {
+						rawEntries[idx] = nil
+					}
+					delete(owners, model.publicID)
+					ambiguousRouteCandidateModels[model.publicID] = struct{}{}
 					continue
 				}
 				return cachedModelsResponse{}, false, providerModelCollisionError(model.publicID, existingProvider, model.providerID)
 			}
 			owners[model.publicID] = model.providerID
+			ownerIndex[model.publicID] = len(rawEntries)
 			rawEntries = append(rawEntries, model.raw)
 		}
 	}
+
+	for _, routeID := range setup.modelRouteOrder {
+		route := setup.modelRoutes[routeID]
+		if route == nil {
+			continue
+		}
+		model := route.syntheticModel()
+		if existingProvider, exists := owners[model.publicID]; exists {
+			return cachedModelsResponse{}, false, fmt.Errorf("model route %q collides with provider-owned model id from provider %q", model.publicID, existingProvider)
+		}
+		owners[model.publicID] = model.providerID
+		ownerIndex[model.publicID] = len(rawEntries)
+		rawEntries = append(rawEntries, model.raw)
+	}
+
+	rawEntries = compactModelRawEntries(rawEntries)
 
 	if sawDynamicProvider && allDynamicProvidersUnchanged {
 		return cachedModelsResponse{etag: ifNoneMatch}, true, nil
@@ -925,6 +967,20 @@ func (h *ProxyHandler) buildMergedModelsEntry(ctx context.Context, rawQuery, ifN
 		expiry:     time.Now().Add(modelsCacheTTL),
 		etag:       mergedETag,
 	}, false, nil
+}
+
+func compactModelRawEntries(entries []json.RawMessage) []json.RawMessage {
+	if len(entries) == 0 {
+		return entries
+	}
+	compact := entries[:0]
+	for _, entry := range entries {
+		if len(entry) == 0 {
+			continue
+		}
+		compact = append(compact, entry)
+	}
+	return compact
 }
 
 // transformModelsResponse adds a Codex-compatible "models" field to the
