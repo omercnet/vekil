@@ -47,6 +47,96 @@ providers:
         name: GPT-5.4 Pro
 ```
 
+### Azure Multi-Endpoint Pool Example
+
+`providers[].endpoints` is a provider-level upstream endpoint pool. It is separate from `models[].endpoints`, which remains the public route allowlist (`/responses`, `/chat/completions`, etc.). Existing single-endpoint configs using provider-level `base_url` and `api_key`/`api_key_env` remain valid.
+
+```yaml
+providers:
+  - id: azure-openai
+    type: azure-openai
+    default: true
+    selector: weighted # round_robin (default), weighted, or least_latency
+    endpoints:
+      - id: east
+        base_url: https://east.example.openai.azure.com/openai/v1
+        api_key_env: AZURE_EAST_API_KEY
+        weight: 2
+        health:
+          error_budget: 10/m
+          cooldown: 30s
+      - id: west
+        base_url: https://west.example.openai.azure.com/openai/v1
+        api_key_env: AZURE_WEST_API_KEY
+        weight: 1
+    models:
+      - public_id: gpt-5.4-pro
+        deployment: gpt-5.4-pro
+        endpoints:
+          - /responses
+        name: GPT-5.4 Pro
+```
+
+Endpoint IDs are required in multi-endpoint pools and appear in structured logs as `endpoint_id`; do not put secrets in them. Endpoint credentials use `api_key` or `api_key_env`; omitted endpoint credentials inherit provider-level credentials. Omitted `weight` defaults to `1`; `weight: 0` is invalid. Health `error_budget` uses `N/{ms,s,m,h}` (for example `10/m`) and `cooldown` uses Go-style durations such as `30s` or `250ms`.
+
+If an endpoint exhausts its error budget, Vekil quarantines it for the cooldown and skips it during selection. Retries for 429/502/503/504 and network errors prefer another healthy endpoint in the same provider. If all endpoints are unhealthy, Vekil logs a degraded state and makes one best-effort probe against the least-recently-failed endpoint.
+
+Copilot multi-account rotation is not part of v1 endpoint pools. Azure/OpenAI-compatible static API-key endpoint pools shipped first; Copilot account rotation remains future work.
+
+### Cross-Provider Model Route Pools
+
+`model_routes` is a top-level, explicit opt-in route pool. It publishes one synthetic public model ID and selects one configured provider/model candidate for each retry attempt. Use it to spread quota across provider runtimes such as one Copilot account, OpenAI Codex, and Azure OpenAI without weakening provider-owned model collision checks.
+
+```yaml
+providers:
+  - id: copilot
+    type: copilot
+    default: true
+    include_models: [gpt-5]
+  - id: openai-codex
+    type: openai-codex
+    include_models: [gpt-5]
+  - id: azure-openai
+    type: azure-openai
+    base_url: https://east.example.openai.azure.com/openai/v1
+    api_key_env: AZURE_OPENAI_API_KEY
+    models:
+      - public_id: gpt-5.4-pro
+        deployment: gpt-5-4-pro-deployment
+        endpoints: [/responses]
+
+model_routes:
+  - public_id: gpt-5-balanced
+    endpoints: [/responses]
+    selector: weighted # round_robin (default), weighted, or least_latency
+    candidates:
+      - provider: copilot
+        model: gpt-5
+        weight: 1
+      - provider: openai-codex
+        model: gpt-5
+        weight: 1
+      - provider: azure-openai
+        model: gpt-5.4-pro
+        weight: 2
+        health:
+          error_budget: 10/m
+          cooldown: 30s
+```
+
+Route candidate `model` values are provider-owned public/discovered model IDs, not raw Azure deployments unless that provider exposes the deployment under that public ID. The route alias appears in `/v1/models` with `owned_by: route:<public_id>`. On inference, Vekil rewrites the request body model to the selected candidate's upstream model/deployment for that attempt.
+
+If `model_routes[].endpoints` is set, every candidate must support each listed public endpoint. If omitted, Vekil exposes only the safe intersection supported by all candidates. Retryable failures (429/502/503/504 and network errors) mark the selected route candidate unhealthy separately from provider endpoint health, then retry against a healthy alternative when available. If a selected Azure candidate also has a provider-local endpoint pool, provider endpoint selection still happens inside that candidate.
+
+| Concept | Config field | Scope | Purpose |
+| --- | --- | --- | --- |
+| Provider endpoint pool | `providers[].endpoints[]` | One provider | Rotate upstream base URLs/keys for that provider. |
+| Model route pool | `model_routes[].candidates[]` | Multiple providers | Publish one alias that spreads traffic across provider/model candidates. |
+| Model endpoint allowlist | `providers[].models[].endpoints[]` | One provider model | Declare public API endpoints a model supports. |
+| Route endpoint allowlist | `model_routes[].endpoints[]` | One route alias | Restrict public API endpoints allowed for all route candidates. |
+
+Limitations: only one Copilot provider/account is supported; route public IDs cannot collide with provider-owned model IDs or other routes; candidate model IDs must already resolve through their provider runtime; Codex candidates remain `/responses`-only; dynamic providers may need `include_models`/`exclude_models` to keep global public model ownership unambiguous.
+
 ### Copilot + Azure Example
 
 ```yaml
@@ -120,6 +210,8 @@ Routing rules:
 - Azure AI Foundry inference URLs ending in `/models` are not supported in `type: "azure-openai"` configs. Use the corresponding OpenAI-compatible `.../openai/v1` endpoint instead.
 - For `/openai/v1` base URLs, omit `api_version`; the proxy calls `/chat/completions`, `/responses`, and `/models` directly with no `api-version` query string.
 - For legacy `/openai` base URLs, set `api_version`; the proxy appends `api-version=...` to upstream requests.
+- For Azure multi-endpoint pools, each `providers[].endpoints[]` entry may set `api_version`; omitted endpoint values inherit provider-level `api_version`.
+- Provider-level `endpoints` means upstream endpoint pool. `models[].endpoints` means route allowlist and keeps its existing semantics.
 - Public model IDs are global across all providers. Startup fails if two providers expose the same ID.
 - `include_models` is the recommended way to use dynamic providers without prefixes. It lets you opt into only the discovered model IDs that should belong to that provider.
 - `exclude_models` lets one provider give ownership of a public ID to another provider.

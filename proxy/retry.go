@@ -53,6 +53,20 @@ func drainAndClose(body io.ReadCloser) {
 // doWithRetry executes an HTTP request with retry on transient failures.
 // The reqFactory is called on each attempt to produce a fresh request body.
 func (h *ProxyHandler) doWithRetry(reqFactory func() (*http.Request, error)) (*http.Response, error) {
+	return h.doWithRetryEndpoint(func(int) (*http.Request, *providerEndpointRuntime, error) {
+		req, err := reqFactory()
+		return req, nil, err
+	})
+}
+
+func (h *ProxyHandler) doWithRetryEndpoint(reqFactory func(attempt int) (*http.Request, *providerEndpointRuntime, error)) (*http.Response, error) {
+	return h.doWithRetryModelRoute(func(attempt int) (*http.Request, *providerEndpointRuntime, *modelRouteCandidateRuntime, error) {
+		req, endpoint, err := reqFactory(attempt)
+		return req, endpoint, nil, err
+	})
+}
+
+func (h *ProxyHandler) doWithRetryModelRoute(reqFactory func(attempt int) (*http.Request, *providerEndpointRuntime, *modelRouteCandidateRuntime, error)) (*http.Response, error) {
 	maxRetries := h.maxRetries
 	if maxRetries == 0 {
 		maxRetries = 3
@@ -64,13 +78,16 @@ func (h *ProxyHandler) doWithRetry(reqFactory func() (*http.Request, error)) (*h
 
 	var lastErr error
 	for attempt := range maxRetries {
-		req, err := reqFactory()
+		req, endpoint, routeCandidate, err := reqFactory(attempt)
 		if err != nil {
 			return nil, err
 		}
 
+		started := time.Now()
 		resp, err := h.client.Do(req)
 		if err != nil {
+			endpoint.recordFailure(time.Now())
+			routeCandidate.recordFailure(time.Now())
 			lastErr = err
 			if attempt < maxRetries-1 {
 				if ctxErr := sleepWithContext(req.Context(), backoff(retryDelay, attempt)); ctxErr != nil {
@@ -81,8 +98,14 @@ func (h *ProxyHandler) doWithRetry(reqFactory func() (*http.Request, error)) (*h
 		}
 
 		if !retryable(resp.StatusCode) {
+			if resp.StatusCode < 500 && resp.StatusCode != http.StatusTooManyRequests {
+				endpoint.recordSuccess(time.Since(started))
+				routeCandidate.recordSuccess(time.Since(started))
+			}
 			return resp, nil
 		}
+		endpoint.recordFailure(time.Now())
+		routeCandidate.recordFailure(time.Now())
 
 		retryAfterHeader := resp.Header.Get("Retry-After")
 

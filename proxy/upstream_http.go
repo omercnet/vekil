@@ -9,6 +9,8 @@ import (
 	"io"
 	"net/http"
 	"strings"
+
+	"github.com/sozercan/vekil/logger"
 )
 
 func (h *ProxyHandler) newInferenceUpstreamContext(streaming bool) (context.Context, context.CancelFunc) {
@@ -119,6 +121,9 @@ func mergeHeaderValues(dst, src http.Header) {
 
 func (h *ProxyHandler) resolveProviderRequest(body []byte, endpoint string) (*providerRuntime, []byte, error) {
 	model := extractRequestModel(body)
+	if route, ok := h.providerSetup().lookupModelRoute(model); ok && route != nil {
+		return nil, nil, &providerRequestError{statusCode: http.StatusBadRequest, err: fmt.Errorf("model route %q must be resolved per retry attempt", model)}
+	}
 	provider, owner, known := h.resolveProviderModel(model, endpoint)
 	if provider == nil {
 		return nil, nil, &providerRequestError{statusCode: http.StatusInternalServerError, err: fmt.Errorf("no provider available for endpoint %s", endpoint)}
@@ -158,17 +163,78 @@ func (h *ProxyHandler) postJSONEndpoint(ctx context.Context, path string, body [
 }
 
 func (h *ProxyHandler) postJSONEndpointWithHeaders(ctx context.Context, path string, body []byte, extraHeaders http.Header) (*http.Response, error) {
+	if route, ok := h.providerSetup().lookupModelRoute(extractRequestModel(body)); ok {
+		return h.postModelRouteJSONEndpointWithHeaders(ctx, path, body, extraHeaders, route)
+	}
+
 	provider, rewrittenBody, err := h.resolveProviderRequest(body, path)
 	if err != nil {
 		return nil, err
 	}
 
-	return h.doWithRetry(func() (*http.Request, error) {
-		req, err := h.newProviderJSONRequest(ctx, provider, http.MethodPost, path, rewrittenBody, extraHeaders, "")
+	excluded := make(map[string]struct{})
+	return h.doWithRetryEndpoint(func(attempt int) (*http.Request, *providerEndpointRuntime, error) {
+		endpoint, degraded, err := provider.selectEndpoint(excluded)
 		if err != nil {
-			return nil, err
+			return nil, nil, err
 		}
-		return req, nil
+		if degraded && h != nil && h.log != nil && endpoint != nil {
+			h.log.Info("provider endpoint pool degraded; probing least-recently-failed endpoint", logger.F("provider", provider.id), logger.F("endpoint_id", endpoint.id), logger.F("upstream_endpoint", path), logger.F("attempt", attempt))
+		}
+		req, err := h.newProviderEndpointJSONRequest(ctx, provider, endpoint, http.MethodPost, path, rewrittenBody, extraHeaders, "")
+		if err != nil {
+			return nil, nil, err
+		}
+		if endpoint != nil {
+			excluded[endpoint.id] = struct{}{}
+		}
+		return req, endpoint, nil
+	})
+}
+
+func (h *ProxyHandler) postModelRouteJSONEndpointWithHeaders(ctx context.Context, path string, body []byte, extraHeaders http.Header, route *modelRouteRuntime) (*http.Response, error) {
+	if route == nil {
+		return nil, &providerRequestError{statusCode: http.StatusInternalServerError, err: fmt.Errorf("model route is required")}
+	}
+	if !route.supportsEndpoint(path) {
+		return nil, &providerRequestError{statusCode: http.StatusBadRequest, err: fmt.Errorf("model %q does not support %s", route.publicID, path)}
+	}
+
+	excludedCandidates := make(map[string]struct{})
+	return h.doWithRetryModelRoute(func(attempt int) (*http.Request, *providerEndpointRuntime, *modelRouteCandidateRuntime, error) {
+		candidate, degraded, err := route.selectCandidate(excludedCandidates)
+		if err != nil {
+			return nil, nil, nil, err
+		}
+		if degraded && h != nil && h.log != nil && candidate != nil {
+			h.log.Info("model route pool degraded; probing least-recently-failed candidate", logger.F("route", route.publicID), logger.F("provider", candidate.providerID), logger.F("model", candidate.modelID), logger.F("upstream_endpoint", path), logger.F("attempt", attempt))
+		}
+		setup := h.providerSetup()
+		provider := setup.providerByID(candidate.providerID)
+		model, ok := setup.lookupProviderModel(candidate.providerID, candidate.modelID)
+		if provider == nil || !ok {
+			return nil, nil, nil, &providerRequestError{statusCode: http.StatusInternalServerError, err: fmt.Errorf("model route %q candidate %s is unavailable", route.publicID, candidate.key())}
+		}
+		if !providerSupportsEndpoint(provider, path) || !providerModelSupportsEndpoint(model, path) {
+			return nil, nil, nil, &providerRequestError{statusCode: http.StatusBadRequest, err: fmt.Errorf("model route %q candidate %s does not support %s", route.publicID, candidate.key(), path)}
+		}
+		rewrittenBody, _, err := rewriteRequestModelForProvider(body, model.upstreamModel)
+		if err != nil {
+			return nil, nil, nil, &providerRequestError{statusCode: http.StatusBadRequest, err: err}
+		}
+		upstreamEndpoint, endpointDegraded, err := provider.selectEndpoint(nil)
+		if err != nil {
+			return nil, nil, nil, err
+		}
+		if endpointDegraded && h != nil && h.log != nil && upstreamEndpoint != nil {
+			h.log.Info("provider endpoint pool degraded; probing least-recently-failed endpoint", logger.F("provider", provider.id), logger.F("endpoint_id", upstreamEndpoint.id), logger.F("upstream_endpoint", path), logger.F("attempt", attempt))
+		}
+		req, err := h.newProviderEndpointJSONRequest(ctx, provider, upstreamEndpoint, http.MethodPost, path, rewrittenBody, extraHeaders, "")
+		if err != nil {
+			return nil, nil, nil, err
+		}
+		excludedCandidates[candidate.key()] = struct{}{}
+		return req, upstreamEndpoint, candidate, nil
 	})
 }
 
